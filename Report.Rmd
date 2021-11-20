@@ -1,0 +1,267 @@
+---
+title: "Movies Recommendation"
+author: "Silas Liu"
+date: "11/20/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+This project intends on modelling a recommendation system for movie ratings, based on the [10M MovieLens dataset](https://grouplens.org/datasets/movielens/10m/). This is an independent set of movie ratings, for purpose of studies on machine learning techniques. This specific set contains 10 million entries, with rating from 72,000 users to 10,000 movies.
+
+Our goal will be developing an algorithm to study the internal structure of the data and predict ratings for movies, based on available data of other users and movies ratings and minimize the residual mean squared error of the predictions.
+
+We start by doing a data analysis on the dataset, proceeding to fitting a model with the training set and applying the model to predict on the verification set.
+
+## Analysis
+The first step will be a data analysis, by making an overview of the edx dataset, which will be used to train the model.
+
+### Data Analysis
+
+```{r library and load pre downloaded data, echo=FALSE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(caret)
+library(data.table)
+library(gridExtra)
+load("Movies_workspace.RData")
+```
+
+```{r analysis 1}
+dim(edx)
+names(edx)
+str(edx)
+head(edx)
+```
+
+We look if there are NA values.
+
+```{r analysis 2, echo = FALSE}
+edx %>%
+  filter(is.na(rating)) %>%
+  summarize(count = n())
+```
+
+It can be seen that the data has no NA values. We proceed then with some insights of the data before the proper modeling.<br>
+By taking a random sample of 100 movies and 100 users and showing them with colored dots, we can see how sparse the dataset of ratings is:
+
+```{r analysis matrix sparse, echo = FALSE}
+users <- sample(unique(edx$userId), 100)
+rafalib::mypar()
+edx %>% filter(userId %in% users) %>% 
+  select(userId, movieId, rating) %>%
+  mutate(rating = 1) %>%
+  spread(movieId, rating) %>% select(sample(ncol(.), 100)) %>% 
+  as.matrix() %>% t(.) %>%
+  image(1:100, 1:100,. , xlab="Movies", ylab="Users")
+abline(h=0:100+0.5, v=0:100+0.5, col = "grey")
+```
+
+The following graphics show the distribution between movies and users. We can notice that some movies are more rated than others, just like there are some users who tend to rate more than others.
+
+```{r analysis distribution of data, echo = FALSE}
+plot_movies <- edx %>% 
+  dplyr::count(movieId) %>% 
+  ggplot(aes(n)) + 
+  geom_histogram(bins = 30, color = "black") + 
+  scale_x_log10() + 
+  ggtitle("Movies")
+
+plot_users <- edx %>%
+  dplyr::count(userId) %>% 
+  ggplot(aes(n)) + 
+  geom_histogram(bins = 30, color = "black") + 
+  scale_x_log10() +
+  ggtitle("Users")
+
+grid.arrange(plot_movies,
+             plot_users,
+             ncol = 2)
+```
+
+### Model 1
+For the first model, we will consider the movie and user effects and apply regularization to the data.<br>
+First we calculate the mean rating over all movies and then we find the residuals as average value for each movie and user. Since the data has many outliers, movies or users with one or few ratings, regularization is applied.<br>
+The equation which needs to be minimized can be written as:<br>
+$\frac{1}{N} \sum_{u,i} (y_{u,i} - \mu - b_{i} - b_{u})^{2} + \lambda(\sum_{i} b_{i}^{2} + \sum_{u} b_{u}^{2})$<br>
+With regularization, the estimates $b_{u}$ and $b_{i}$, for user and movie, respectively, that minimize the equation are given by:<br>
+$\hat{b}_{i}(\lambda) = \frac{1}{\lambda + n_{i}} \sum_{i=1}^{n_{i}} (Y_{u,i} - \hat{\mu})$<br>
+$\hat{b}_{u}(\lambda) = \frac{1}{\lambda + n_{u}} \sum_{u=1}^{n_{u}} (Y_{u,i} - \hat{\mu} - \hat{b}_{i})$<br>
+In order to optimize our model, we calculate the residual mean squared error (user $u$ and movie $i$), which is defined by:<br>
+$RMSE = \sqrt{\frac{1}{N}\sum_{u,i} (\hat{y}_{u,i} - y_{u,i})^{2}}$
+
+```{r rmse}
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+Since $\lambda$ is a tunning parameter of our model, we apply 10-fold cross validation to find the best value for it.
+
+```{r lambda parameter tuning, model 1}
+lambdas <- seq(0, 10, 0.25)
+folds <- createFolds(edx$rating, k = 10, list = TRUE, returnTrain = FALSE)
+
+rmses <- sapply(lambdas, function(l){
+  rmse <- sapply(folds, function(i){
+    train_set_star <- edx[i,]
+    test_set_star <- edx[-i,] %>%
+      semi_join(train_set_star, by="movieId") %>%
+      semi_join(train_set_star, by="userId")
+    
+    mu <- mean(train_set_star$rating)
+    b_i <- train_set_star %>%
+      group_by(movieId) %>%
+      summarize(b_i = sum(rating - mu)/(n()+l))
+    b_u <- train_set_star %>%
+      left_join(b_i, by="movieId") %>%
+      group_by(userId) %>%
+      summarize(b_u = sum(rating - mu - b_i)/(n()+l))
+    
+    predicted_ratings <- test_set_star %>%
+      left_join(b_i, by="movieId") %>%
+      left_join(b_u, by="userId") %>%
+      mutate(pred = mu + b_i + b_u) %>%
+      .$pred
+    return(RMSE(test_set_star$rating, predicted_ratings))
+  })
+  return(mean(rmse))
+})
+```
+
+With the tunned parameter, we are able to train the model from the entire training set and predict it on the verification set:
+
+```{r lambdas 1}
+lambda <- lambdas[which.min(rmses)]
+mu_hat <- mean(edx$rating)
+b_i <- edx %>%
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu_hat)/(n()+lambda))
+b_u <- edx %>%
+  left_join(b_i, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - mu_hat - b_i)/(n()+lambda))
+
+predicted_ratings <- validation %>%
+  left_join(b_i, by="movieId") %>%
+  left_join(b_u, by="userId") %>%
+  mutate(pred = mu_hat + b_i + b_u) %>%
+  .$pred
+```
+
+```{r saving results 1, echo=FALSE, message=FALSE, warning=FALSE}
+lambdas_1 <- qplot(lambdas, rmses)
+min_lambdas_1 <- lambdas[which.min(rmses)]
+
+model_1_rmse <- RMSE(validation$rating, predicted_ratings)
+rmse_results <- tibble(method = "Model 1: Regularized Movie + User Effect",
+                       RMSE = model_1_rmse)
+```
+
+### Model 2
+Our second model will consider the genre effect as well, in addition to the movie and user effect.<br>
+In previous analysis we verified that there is correlation between the rating and movie genres. We group together each different genre or combination of genres and look for their average values, applying to the model.<br>
+At the end we also apply regularization to the data.<br>
+We start by tunning the $\lambda$ parameter with 10-fold cross validation.
+
+```{r clean data, echo=FALSE, message=FALSE, warning=FALSE}
+rm(rmses, lambda, b_i, b_u, predicted_ratings)
+```
+
+```{r lambda parameter tuning, model 2}
+rmses <- sapply(lambdas, function(l){
+  rmse <- sapply(folds, function(i){
+    train_set_star <- edx[i,]
+    test_set_star <- edx[-i,] %>%
+      semi_join(train_set_star, by="movieId") %>%
+      semi_join(train_set_star, by="userId")
+    
+    mu <- mean(train_set_star$rating)
+    b_i <- train_set_star %>%
+      group_by(movieId) %>%
+      summarize(b_i = sum(rating - mu)/(n()+l))
+    b_u <- train_set_star %>%
+      left_join(b_i, by="movieId") %>%
+      group_by(userId) %>%
+      summarize(b_u = sum(rating - mu - b_i)/(n()+l))
+    b_g <- train_set_star %>%
+      left_join(b_i, by="movieId") %>%
+      left_join(b_u, by="userId") %>%
+      group_by(genres) %>%
+      summarize(b_g = sum(rating - mu - b_i - b_u)/(n()+l))
+    
+    predicted_ratings <- test_set_star %>%
+      left_join(b_i, by="movieId") %>%
+      left_join(b_u, by="userId") %>%
+      left_join(b_g, by="genres") %>%
+      mutate(pred = mu + b_i + b_u + b_g) %>%
+      .$pred
+    return(RMSE(test_set_star$rating, predicted_ratings))
+  })
+  return(mean(rmse))
+})
+```
+
+With the tunned parameter, we are able to fit the model with the entire training set and predict it on the verification set:
+
+```{r lambdas 2}
+lambda <- lambdas[which.min(rmses)]
+b_i <- edx %>%
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu_hat)/(n()+lambda))
+b_u <- edx %>%
+  left_join(b_i, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - mu_hat - b_i)/(n()+lambda))
+b_g <- edx %>%
+  left_join(b_i, by = "movieId") %>%
+  left_join(b_u, by = "userId") %>%
+  group_by(genres) %>%
+  summarize(b_g = sum(rating - mu_hat - b_i - b_u)/(n()+lambda))
+
+predicted_ratings <- validation %>%
+  left_join(b_i, by="movieId") %>%
+  left_join(b_u, by="userId") %>%
+  left_join(b_g, by="genres") %>%
+  mutate(pred = mu_hat + b_i + b_u + b_g) %>%
+  .$pred
+```
+
+```{r saving results 2, echo=FALSE, message=FALSE, warning=FALSE}
+lambdas_2 <- qplot(lambdas, rmses)
+min_lambdas_2 <- lambdas[which.min(rmses)]
+
+model_2_rmse <- RMSE(validation$rating, predicted_ratings)
+rmse_results <- bind_rows(rmse_results,
+                          tibble(method = "Model 2: Regularized Movie + User + Genre Effect",
+                                 RMSE = model_2_rmse))
+```
+
+## Results
+This section presents the results obtained from the parameter tunning and model fitting as well as its performance.<br>
+The tunning process for $\lambda$ searchs for the minimum RMSE, the best value. Below we can look at the tunning for both models and their best value:
+
+```{r lambda tunning graphic}
+lambdas_1
+min_lambdas_1
+
+lambdas_2
+min_lambdas_2
+```
+
+With the best $\lambda$, we can calculate the RMSE of each model, comparing with the validation set ratings:
+
+```{r model rmse, echo = FALSE}
+rmse_results %>% knitr::kable()
+```
+
+## Conclusion
+With this project we were able to construct two models for movie recommendation system, applying regularization on the data. Both used data from a training set to train the models, and fit and validate them on a validation set. For the parameter tuning process, we used only the training set with 10-fold cross validation.<br>
+The first model considered only movies and users as predictors, while the second model also considered the genres as predictor.<br><br>
+
+The RMSE found on the second model was better, below 0.86490.<br>
+The limitations of the final model is that predictions on new users or movies will not be possible, since they both must appear in the training set.<br>
+So the model needs to be improved and retrained with new data, in a regular time frame, when there are new movies or users.<br>
+For future work we suggest improvement on the model, by analyzing and better modeling the effect of the genres on the rating.
